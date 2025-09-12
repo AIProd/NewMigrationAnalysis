@@ -18,6 +18,7 @@ TIMEPOINTS = [0, 24, 48, 72]  # fixed
 DOSE_CHOICES_NM = [1, 5, 10, 20, 40, 100, 500]
 CELL_LINES = ["RCC", "Renca"]
 COMPOUNDS = ["GenX", "PFOA", "PFOS"]
+IMG_TYPES = ["png", "jpg", "jpeg", "tif", "tiff"]  # <— TIFF support
 
 OKABE_ITO = ["#E69F00", "#56B4E9", "#009E73", "#F0E442",
              "#0072B2", "#D55E00", "#CC79A7", "#000000"]
@@ -92,6 +93,35 @@ def segment_open(gray01: np.ndarray, std_sigma: float, sens: float,
     if min_area > 0:
         mask = remove_small_objects(mask, min_size=min_area)
     return mask
+
+def load_uploaded_image(file_obj):
+    """
+    Robust loader for PNG/JPG/TIFF.
+    - Scales 16-bit or float images to 8-bit
+    - If multi-page TIFF, returns the first frame (noted in caption)
+    Returns (pil_rgb_image, n_frames, is_tiff)
+    """
+    im = Image.open(file_obj)
+    is_tiff = (im.format or "").upper() == "TIFF"
+    n_frames = int(getattr(im, "n_frames", 1))
+    try:
+        im.seek(0)  # first frame
+    except Exception:
+        pass
+
+    arr = np.array(im)
+
+    # Scale to uint8 if needed (e.g., 16-bit TIFF)
+    if arr.dtype != np.uint8:
+        arr = exposure.rescale_intensity(arr, in_range="image", out_range=(0, 255)).astype(np.uint8)
+
+    # Ensure 3-channel RGB
+    if arr.ndim == 2:
+        pil_rgb = Image.fromarray(arr, mode="L").convert("RGB")
+    else:
+        pil_rgb = Image.fromarray(arr).convert("RGB")
+
+    return pil_rgb, n_frames, is_tiff
 
 def analyze_image(pil_image: Image.Image, roi_margin: float, bg_sigma: float,
                   std_sigma: float, sens: float, open_r: int, close_r: int,
@@ -208,7 +238,7 @@ with st.sidebar:
 
 # === Upload grid: 2 doses × 4 timepoints ===
 st.markdown("#### Upload images (2 doses × 4 time points)")
-uploads = { }  # {dose_nm: {t: PIL.Image}}
+uploads = {}  # {dose_nm: {t: PIL.Image}}
 if len(doses) == 2:
     row1 = st.columns(4)
     row2 = st.columns(4)
@@ -217,12 +247,13 @@ if len(doses) == 2:
         st.markdown(f"**Dose {dose} nM**")
         for t, col in zip(TIMEPOINTS, cols):
             with col:
-                f = st.file_uploader(f"{t} h — {dose} nM", type=["png","jpg","jpeg"], key=f"{dose}_{t}")
+                f = st.file_uploader(f"{t} h — {dose} nM", type=IMG_TYPES, key=f"{dose}_{t}")
                 if f:
                     try:
-                        img = Image.open(f).convert("RGB")
+                        img, n_frames, is_tiff = load_uploaded_image(f)
                         uploads.setdefault(dose, {})[t] = img
-                        st.image(img, caption=f"{t} h — {dose} nM", use_container_width=True)
+                        note = f" (TIFF, showing 1/{n_frames})" if is_tiff and n_frames > 1 else ""
+                        st.image(img, caption=f"{t} h — {dose} nM{note}", use_container_width=True)
                     except Exception:
                         st.error("Could not read image.")
 
