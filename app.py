@@ -1,4 +1,4 @@
-# ----------------- Migration Image Analysis (PFAS, 2 doses/run) -----------------
+# ----------------- Migration Image Analysis (PFAS, Vehicle + doses) -----------------
 import io, os
 import numpy as np
 import pandas as pd
@@ -15,11 +15,14 @@ from skimage.morphology import remove_small_objects, binary_opening, binary_clos
 st.set_page_config(page_title="Migration Image Analysis", layout="wide")
 
 TIMEPOINTS = [0, 24, 48, 72]  # fixed
-DOSE_CHOICES_NM = [1, 5, 10, 20, 40, 100, 500]
+# Include Vehicle alongside numeric doses
+DOSE_CHOICES = ["Vehicle", 1, 5, 10, 20, 40, 100, 500]
 CELL_LINES = ["RCC", "Renca"]
 COMPOUNDS = ["GenX", "PFOA", "PFOS"]
-IMG_TYPES = ["png", "jpg", "jpeg", "tif", "tiff"]  # <— TIFF support
+IMG_TYPES = ["png", "jpg", "jpeg", "tif", "tiff"]  # TIFF support
 
+# Colors
+CTRL_GRAY = "#595959"  # Vehicle (no treatment)
 OKABE_ITO = ["#E69F00", "#56B4E9", "#009E73", "#F0E442",
              "#0072B2", "#D55E00", "#CC79A7", "#000000"]
 
@@ -34,14 +37,12 @@ def _downscale(img: np.ndarray, max_side: int = 1600) -> np.ndarray:
     return np.array(Image.fromarray(img).resize((new_w, new_h), Image.BILINEAR))
 
 def illumination_correct(gray: np.ndarray, sigma_bg: float) -> np.ndarray:
-    """Divide by heavy gaussian to flatten illumination; rescale to [0,1]."""
     bg = gaussian(gray, sigma=sigma_bg, preserve_range=True)
     corr = gray / np.clip(bg, 1e-6, None)
     corr = exposure.rescale_intensity(corr, in_range='image', out_range=(0, 1))
     return corr
 
 def local_std(gray: np.ndarray, sigma: float) -> np.ndarray:
-    """Local texture std via Gaussian moments."""
     m1 = gaussian(gray, sigma=sigma, preserve_range=True)
     m2 = gaussian(gray * gray, sigma=sigma, preserve_range=True)
     var = np.clip(m2 - m1 * m1, 0, None)
@@ -50,7 +51,6 @@ def local_std(gray: np.ndarray, sigma: float) -> np.ndarray:
     return std
 
 def center_roi_mask(h: int, w: int, margin_frac: float) -> np.ndarray:
-    """Centered ROI; trims margins on all sides. margin=0 → full image."""
     r0, r1 = int(h * margin_frac), int(h * (1 - margin_frac))
     c0, c1 = int(w * margin_frac), int(w * (1 - margin_frac))
     m = np.zeros((h, w), dtype=bool)
@@ -58,7 +58,6 @@ def center_roi_mask(h: int, w: int, margin_frac: float) -> np.ndarray:
     return m
 
 def mask_scale_bar(h: int, w: int, width_frac: float, height_frac: float, inset_frac: float = 0.02) -> np.ndarray:
-    """Mask a bottom-right rectangle (scale bar area)."""
     if width_frac <= 0 or height_frac <= 0:
         return np.zeros((h, w), dtype=bool)
     bw = int(w * width_frac); bh = int(h * height_frac)
@@ -82,10 +81,8 @@ def segment_open(gray01: np.ndarray, std_sigma: float, sens: float,
       - 'high' -> open = high texture
     """
     s = local_std(gray01, sigma=std_sigma)
-    thr = threshold_otsu(s)
-    thr = thr * (1.0 + sens)  # shift threshold
+    thr = threshold_otsu(s) * (1.0 + sens)  # shift threshold
     mask = (s <= thr) if open_class == "low" else (s >= thr)
-
     if open_r > 0:
         mask = binary_opening(mask, footprint=disk(open_r))
     if close_r > 0:
@@ -108,34 +105,25 @@ def load_uploaded_image(file_obj):
         im.seek(0)  # first frame
     except Exception:
         pass
-
     arr = np.array(im)
-
-    # Scale to uint8 if needed (e.g., 16-bit TIFF)
     if arr.dtype != np.uint8:
         arr = exposure.rescale_intensity(arr, in_range="image", out_range=(0, 255)).astype(np.uint8)
-
-    # Ensure 3-channel RGB
     if arr.ndim == 2:
         pil_rgb = Image.fromarray(arr, mode="L").convert("RGB")
     else:
         pil_rgb = Image.fromarray(arr).convert("RGB")
-
     return pil_rgb, n_frames, is_tiff
 
 def analyze_image(pil_image: Image.Image, roi_margin: float, bg_sigma: float,
                   std_sigma: float, sens: float, open_r: int, close_r: int,
                   min_area: int, open_class: str, sbw: float, sbh: float):
-    """Return (raw_open_pct, overlay_png_bytes)."""
     rgb = np.array(pil_image.convert("RGB"))
     rgb = _downscale(rgb, max_side=1600)
     gray = rgb2gray(rgb).astype(np.float32)
-
     corr = illumination_correct(gray, sigma_bg=bg_sigma)
     mask_open = segment_open(corr, std_sigma=std_sigma, sens=sens,
                              open_r=open_r, close_r=close_r, min_area=min_area,
                              open_class=open_class)
-
     h, w = mask_open.shape
     roi = center_roi_mask(h, w, roi_margin)
     sb  = mask_scale_bar(h, w, width_frac=sbw, height_frac=sbh)
@@ -143,23 +131,19 @@ def analyze_image(pil_image: Image.Image, roi_margin: float, bg_sigma: float,
     keep_pix = int(keep.sum())
     valid = mask_open & keep
     raw_open_pct = 100.0 * (valid.sum() / max(1, keep_pix))
-
     base = (corr * 255).astype(np.uint8)
     base_rgb = np.repeat(base[..., None], 3, axis=2)
     overlay = overlay_mask(base_rgb, valid, alpha=0.42, color=(0, 180, 255))
-
     rr0, rr1 = int(h * roi_margin), int(h * (1 - roi_margin))
     cc0, cc1 = int(w * roi_margin), int(w * (1 - roi_margin))
     overlay[rr0:rr1, [cc0, cc1 - 1]] = (0, 255, 90)
     overlay[[rr0, rr1 - 1], cc0:cc1] = (0, 255, 90)
     overlay[sb] = (200, 200, 200)
-
     buf = io.BytesIO()
     Image.fromarray(overlay).save(buf, format="PNG")
     return raw_open_pct, buf.getvalue()
 
 def summarize_series(raw_by_t: dict):
-    """Return DataFrame with Raw, Relative Open %, Closure % (baseline = 0h)."""
     baseline = raw_by_t.get(0, np.nan)
     rows = []
     for t in sorted(raw_by_t.keys()):
@@ -170,12 +154,9 @@ def summarize_series(raw_by_t: dict):
     return pd.DataFrame(rows).set_index("Hours"), baseline
 
 def _try_load_font(size: int):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    ]
-    for p in candidates:
+    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]:
         if os.path.exists(p):
             try:
                 return ImageFont.truetype(p, size=size)
@@ -185,7 +166,6 @@ def _try_load_font(size: int):
 
 def annotate_bytes(img_bytes: bytes, text: str, corner: str = "br", scale: float = 0.035,
                    fg=(255, 221, 0, 255), shadow=(0, 0, 0, 255)):
-    """Draw a high-contrast, large label onto PNG bytes."""
     img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
     draw = ImageDraw.Draw(img, "RGBA")
     W, H = img.size
@@ -205,21 +185,25 @@ def annotate_bytes(img_bytes: bytes, text: str, corner: str = "br", scale: float
     img.convert("RGB").save(out, format="PNG")
     return out.getvalue()
 
+def dose_label(d):
+    return "Vehicle" if (isinstance(d, str) and d.lower() == "vehicle") or d == "Vehicle" else f"{d} nM"
+
 # ------------------------------- UI -----------------------------------
 st.title("Migration Image Analysis")
 
-# === Study metadata & processing controls (sidebar) ===
 with st.sidebar:
     st.header("Experiment")
     cell_line = st.selectbox("Cell line", CELL_LINES, index=0)
     compound  = st.selectbox("Compound", COMPOUNDS, index=0)
 
     doses = st.multiselect(
-        "Select exactly two doses (nM)", DOSE_CHOICES_NM, default=[10, 40],
-        help="One run = one cell line × compound with two doses across 0/24/48/72h"
+        "Select 2–3 items (include Vehicle for comparison)",
+        DOSE_CHOICES,
+        default=["Vehicle", 10],
+        help="Upload 0/24/48/72 h images for each selected item."
     )
-    if len(doses) != 2:
-        st.warning("Please pick exactly two doses.", icon="⚠️")
+    if not (2 <= len(doses) <= 3):
+        st.warning("Please pick 2–3 items (e.g., Vehicle + 1–2 doses).", icon="⚠️")
 
     st.header("Processing")
     roi_margin = st.slider("ROI margin (0 = full image)", 0.00, 0.25, 0.00, 0.01,
@@ -236,24 +220,22 @@ with st.sidebar:
     sb_width   = st.slider("Scale-bar width (frac)", 0.00, 0.30, 0.12, 0.01, disabled=not sb_mask)
     sb_height  = st.slider("Scale-bar height (frac)", 0.00, 0.20, 0.06, 0.01, disabled=not sb_mask)
 
-# === Upload grid: 2 doses × 4 timepoints ===
-st.markdown("#### Upload images (2 doses × 4 time points)")
-uploads = {}  # {dose_nm: {t: PIL.Image}}
-if len(doses) == 2:
-    row1 = st.columns(4)
-    row2 = st.columns(4)
-    dose_to_cols = {doses[0]: row1, doses[1]: row2}
-    for dose, cols in dose_to_cols.items():
-        st.markdown(f"**Dose {dose} nM**")
+# === Upload grid: variable rows (one per selected item) ===
+st.markdown("#### Upload images (each item × 4 time points)")
+uploads = {}  # {dose_key: {t: PIL.Image}}
+if 2 <= len(doses) <= 3:
+    for dose in doses:
+        st.markdown(f"**{dose_label(dose)}**")
+        cols = st.columns(4)
         for t, col in zip(TIMEPOINTS, cols):
             with col:
-                f = st.file_uploader(f"{t} h — {dose} nM", type=IMG_TYPES, key=f"{dose}_{t}")
+                f = st.file_uploader(f"{t} h — {dose_label(dose)}", type=IMG_TYPES, key=f"{str(dose)}_{t}")
                 if f:
                     try:
                         img, n_frames, is_tiff = load_uploaded_image(f)
                         uploads.setdefault(dose, {})[t] = img
                         note = f" (TIFF, showing 1/{n_frames})" if is_tiff and n_frames > 1 else ""
-                        st.image(img, caption=f"{t} h — {dose} nM{note}", use_container_width=True)
+                        st.image(img, caption=f"{t} h — {dose_label(dose)}{note}", use_container_width=True)
                     except Exception:
                         st.error("Could not read image.")
 
@@ -261,8 +243,8 @@ st.divider()
 go = st.button("▶️ Analyze", type="primary", use_container_width=True)
 
 # ------------------------------ ANALYSIS ------------------------------
-def run_series(images_by_t, dose_nm, color_hex):
-    """Analyze a set of 0/24/48/72 images for one dose."""
+def run_series(images_by_t, dose_key, color_hex, is_vehicle=False):
+    """Analyze a set of 0/24/48/72 images for one item (Vehicle or dose)."""
     raw, overlays = {}, {}
     mode = "low" if open_mode == "Low texture" else ("high" if open_mode == "High texture" else "low")
     for t in sorted(images_by_t.keys()):
@@ -291,55 +273,65 @@ def run_series(images_by_t, dose_nm, color_hex):
                 raw[t], overlays[t] = val, ov
 
     df, baseline = summarize_series(raw)
-    # annotate overlays with dose + metrics
+
+    # annotate overlays
     ann = {}
     for t in overlays:
         rel = df.loc[t, "Relative Open %"] if t in df.index else np.nan
         clo = df.loc[t, "Closure %"] if t in df.index else np.nan
-        label = f"{t} h — {dose_nm} nM\nOpen {raw[t]:.2f}%"
+        lbl = f"{t} h — {dose_label(dose_key)}\nOpen {raw[t]:.2f}%"
         if rel == rel:
-            label += f" | Rel {rel:.1f}% | Close {clo:.1f}%"
-        ann[t] = annotate_bytes(overlays[t], label, corner="br", scale=0.040, fg=(255,221,0,255))
-    return df, baseline, ann, color_hex
+            lbl += f" | Rel {rel:.1f}% | Close {clo:.1f}%"
+        ann[t] = annotate_bytes(overlays[t], lbl, corner="br", scale=0.040, fg=(255,221,0,255))
 
-if go and len(doses) == 2 and any(uploads.values()):
-    # assign distinct colors for the two doses
-    dose_colors = {doses[0]: OKABE_ITO[0], doses[1]: OKABE_ITO[1]}
+    return df, baseline, ann, color_hex, is_vehicle
+
+if go and 2 <= len(doses) <= 3 and any(uploads.values()):
+    # Color map: Vehicle = gray dashed; other doses = Okabe–Ito colors
+    dose_colors = {}
+    for d in doses:
+        if isinstance(d, str) and d.lower() == "vehicle":
+            dose_colors[d] = CTRL_GRAY
+        else:
+            # assign next unused Okabe color (skip gray)
+            taken = set(dose_colors.values())
+            next_col = next(c for c in OKABE_ITO if c not in taken and c != CTRL_GRAY)
+            dose_colors[d] = next_col
+
     results = {}
     for dose in doses:
         if dose in uploads and uploads[dose]:
-            results[dose] = run_series(uploads[dose], dose, dose_colors[dose])
+            is_vehicle = (isinstance(dose, str) and dose.lower() == "vehicle")
+            results[dose] = run_series(uploads[dose], dose, dose_colors[dose], is_vehicle=is_vehicle)
 
     if not results:
         st.warning("Please upload at least one image.", icon="ℹ️")
     else:
         left, right = st.columns([1, 1])
 
-        # --- Left: Overlays in a 2×4 grid ---
+        # --- Left: Overlays grid, one row per item ---
         with left:
             st.markdown(f"#### Detection overlays — **{cell_line} / {compound}**")
-            g = st.columns(4)
-            # row for each dose
-            for row_i, dose in enumerate(doses):
-                st.markdown(f"**Dose {dose} nM**")
+            for dose in doses:
+                st.markdown(f"**{dose_label(dose)}**")
+                row_cols = st.columns(4)
                 for j, t in enumerate(TIMEPOINTS):
-                    img_bytes = results.get(dose, (None,None,{},None))[2].get(t)
+                    img_bytes = results.get(dose, (None,None,{},None,None))[2].get(t)
                     if img_bytes is not None:
-                        with g[j]:
+                        with row_cols[j]:
                             st.image(img_bytes, use_container_width=True)
                     else:
-                        with g[j]:
+                        with row_cols[j]:
                             st.info(f"No image ({t} h)")
 
         # --- Right: Combined table + plot ---
         with right:
             st.markdown(f"#### 📊 Baseline-normalized results — **{cell_line} / {compound}**")
-            # build long table Dose, Hours, Raw/Rel/Closure
             tbl_rows = []
             for dose in doses:
                 if dose in results:
-                    df, base, _, _ = results[dose]
-                    ddf = df.reset_index().assign(Dose=f"{dose} nM", Baseline=f"{base:.2f}")
+                    df, base, _, _, _ = results[dose]
+                    ddf = df.reset_index().assign(Dose=dose_label(dose), Baseline=f"{base:.2f}")
                     tbl_rows.append(ddf)
             if tbl_rows:
                 long_df = pd.concat(tbl_rows, ignore_index=True)
@@ -349,22 +341,24 @@ if go and len(doses) == 2 and any(uploads.values()):
                     use_container_width=True, height=320
                 )
 
-                # Line plot with the two doses
-                fig, ax = plt.subplots(figsize=(5.8, 3.8))
+                # Plot: Vehicle dashed gray; other doses solid
+                fig, ax = plt.subplots(figsize=(6.2, 4.0))
                 for dose in doses:
                     if dose in results:
-                        df, base, _, col = results[dose]
+                        df, base, _, col, is_vehicle = results[dose]
                         x = df.index.values
                         y = df["Closure %"].values.astype(float)
-                        ax.plot(x, y, marker="o", linewidth=2.6, color=col,
-                                label=f"{dose} nM (baseline {base:.2f}%)")
+                        style = "--" if is_vehicle else "-"
+                        ax.plot(x, y, style, marker="o", linewidth=2.6,
+                                color=(CTRL_GRAY if is_vehicle else col),
+                                label=f"{dose_label(dose)} (baseline {base:.2f}%)")
                 ax.set_xlabel("Hours")
                 ax.set_ylabel("Closure % (relative to 0h)")
-                ax.set_title(f"{cell_line} — {compound} (two-dose run)")
+                ax.set_title(f"{cell_line} — {compound} (comparison)")
                 ax.grid(True, linestyle="--", alpha=0.5)
-                # keep legends outside bottom
-                fig.subplots_adjust(bottom=0.28)
-                fig.legend(loc="lower center", ncols=2, frameon=True, facecolor="white", framealpha=0.9)
+                fig.subplots_adjust(bottom=0.30)
+                fig.legend(loc="lower center", ncols=min(len(doses), 3),
+                           frameon=True, facecolor="white", framealpha=0.9)
                 st.pyplot(fig, use_container_width=True)
 
                 # CSV download
@@ -372,14 +366,9 @@ if go and len(doses) == 2 and any(uploads.values()):
                 long_df_inspect.insert(0, "Cell line", cell_line)
                 long_df_inspect.insert(1, "Compound", compound)
                 csv = long_df_inspect.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download CSV",
-                    csv,
-                    file_name=f"migration_{cell_line}_{compound}_{doses[0]}nM_{doses[1]}nM.csv",
-                    use_container_width=True
-                )
+                fname = f"migration_{cell_line}_{compound}_" + "_".join([str(d).lower() for d in doses]) + ".csv"
+                st.download_button("Download CSV", csv, file_name=fname, use_container_width=True)
             else:
                 st.info("No analyzed images yet. Upload and click **Analyze**.")
-
 else:
-    st.info("Select two doses, upload images for **0/24/48/72 h** (for each dose), then click **Analyze**.")
+    st.info("Pick 2–3 items (include **Vehicle**), upload 0/24/48/72 h images for each, then click **Analyze**.")
